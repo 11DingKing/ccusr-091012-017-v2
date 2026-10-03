@@ -3,6 +3,9 @@
 """
 import logging
 import io
+from datetime import datetime
+
+from django.db import models
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -10,14 +13,20 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+)
+from . import records as record_service
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
+    GoodsSerializer,
+    StockInSerializer, StockInWriteSerializer,
+    StockOutSerializer, StockOutWriteSerializer,
     WarningSerializer, ApprovalSerializer
 )
+from .periods import sign_stock_out, complete_stock_out
 
 logger = logging.getLogger('apps')
 
@@ -561,78 +570,268 @@ class VarietyImportView(APIView):
         )
 
 
-# ==================== 其他视图占位 ====================
+# ==================== 货物 / 收发记录 / 审批 ====================
 
-class DashboardView(APIView):
-    """仪表盘视图"""
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'message': '仪表盘功能开发中...'
-        })
+def _parse_date(value):
+    if not value:
+        return None
+    return datetime.strptime(value, '%Y-%m-%d').date()
+
+
+def _apply_period_version(queryset, request):
+    """按期间/版本过滤。
+
+    - 只给 period：返回该期间当前的全部有效记录（当前版本状态），
+      每条记录带 version_no 标识其落账/最后更正的版本；
+    - version=N：只看第 N 版引入或更正的记录（更正审计视角）；
+    - 历史版本的完整可重现明细由封账快照接口提供。
+    """
+    period = request.query_params.get('period')
+    if not period:
+        return queryset
+    queryset = queryset.filter(period=period)
+    version = request.query_params.get('version')
+    if version:
+        queryset = queryset.filter(version_no=int(version))
+    return queryset
 
 
 class GoodsListView(APIView):
     """货物列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety', 'variety__category', 'variety__category__unit'
+        ).all()
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(
+                models.Q(name__icontains=keyword) | models.Q(code__icontains=keyword)
+            )
+        is_active = request.query_params.get('is_active')
+        if is_active in ('true', 'false'):
+            queryset = queryset.filter(is_active=is_active == 'true')
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        goods = queryset.order_by('-created_at')[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': GoodsSerializer(goods, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })
 
 
 class StockInListView(APIView):
-    """入库记录列表视图"""
+    """入库记录：默认当前版本（开放期为实时数据），支持按期间与版本追溯。"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator').all()
+        queryset = self._apply_filters(request, queryset)
+        return self._paginate(request, queryset)
+
+    def post(self, request):
+        serializer = StockInWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        record = record_service.create_stock_in(
+            request.user,
+            goods_id=data['goods'],
+            quantity=data['quantity'],
+            business_date=data.get('business_date'),
+            batch_no=data.get('batch_no', ''),
+            supplier=data.get('supplier', ''),
+            remark=data.get('remark', ''),
+        )
+        logger.info("User %s created stock-in %s", request.user.username, record.id)
+        return success_response(data=StockInSerializer(record).data, message='入库登记成功')
+
+    def _apply_filters(self, request, queryset):
+        queryset = _apply_period_version(queryset, request)
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        start, end = _parse_date(request.query_params.get('start_date')), _parse_date(request.query_params.get('end_date'))
+        if start:
+            queryset = queryset.filter(stock_in_time__date__gte=start)
+        if end:
+            queryset = queryset.filter(stock_in_time__date__lte=end)
+        return queryset
+
+    def _paginate(self, request, queryset):
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        records = queryset.order_by('-stock_in_time')[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockInSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })
+
+
+class StockInDetailView(APIView):
+    """入库记录修改/删除（封账期间被服务层拒绝）"""
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, pk):
+        serializer = StockInWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        record = record_service.update_stock_in(
+            request.user, pk,
+            quantity=data.get('quantity'),
+            business_date=data.get('business_date'),
+            batch_no=data.get('batch_no'),
+            supplier=data.get('supplier'),
+            remark=data.get('remark'),
+        )
+        return success_response(data=StockInSerializer(record).data, message='更新成功')
+
+    def delete(self, request, pk):
+        record_service.delete_stock_in(request.user, pk)
+        return success_response(message='删除成功')
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库记录：默认当前版本，支持按期间与版本追溯。"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator').all()
+        queryset = self._apply_filters(request, queryset)
+        return self._paginate(request, queryset)
+
+    def post(self, request):
+        serializer = StockOutWriteSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        record = record_service.create_stock_out(
+            request.user,
+            goods_id=data['goods'],
+            quantity=data['quantity'],
+            receiver=data['receiver'],
+            receiver_dept=data.get('receiver_dept', ''),
+            business_date=data.get('business_date'),
+            remark=data.get('remark', ''),
+        )
+        logger.info("User %s created stock-out %s", request.user.username, record.id)
+        return success_response(data=StockOutSerializer(record).data, message='出库申请已提交')
+
+    def _apply_filters(self, request, queryset):
+        queryset = _apply_period_version(queryset, request)
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        return queryset
+
+    def _paginate(self, request, queryset):
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        records = queryset.order_by('-created_at')[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockOutSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })
+
+
+class StockOutDetailView(APIView):
+    """出库记录修改/删除（仅待审批单可直接改，封账期间被服务层拒绝）"""
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, pk):
+        serializer = StockOutWriteSerializer(data=request.data, partial=True)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        record = record_service.update_stock_out(
+            request.user, pk,
+            quantity=data.get('quantity'),
+            receiver=data.get('receiver'),
+            receiver_dept=data.get('receiver_dept'),
+            business_date=data.get('business_date'),
+            remark=data.get('remark'),
+        )
+        return success_response(data=StockOutSerializer(record).data, message='更新成功')
+
+    def delete(self, request, pk):
+        record_service.delete_stock_out(request.user, pk)
+        return success_response(message='删除成功')
+
+
+class StockOutSignView(APIView):
+    """出库单签署（审批）：并发签署结果确定，仅首次生效"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        approved = request.data.get('approved')
+        if not isinstance(approved, bool):
+            return error_response(message='请给出明确的审批结果 approved=true/false')
+        if not request.user.is_admin:
+            return error_response(message='无权限审批', code=403)
+        record = sign_stock_out(pk, request.user, approved, request.data.get('remark', ''))
+        return success_response(
+            data=StockOutSerializer(record).data,
+            message='已通过' if approved else '已拒绝',
+        )
+
+
+class StockOutCompleteView(APIView):
+    """已批准出库单完成发放"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        record = complete_stock_out(pk, request.user)
+        return success_response(data=StockOutSerializer(record).data, message='发放完成')
 
 
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Warning.objects.select_related('goods').all()
+        is_read = request.query_params.get('is_read')
+        if is_read in ('true', 'false'):
+            queryset = queryset.filter(is_read=is_read == 'true')
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        warnings = queryset.order_by('-created_at')[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': WarningSerializer(warnings, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })
 
 
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Approval.objects.select_related('stock_out', 'approver').all()
+        stock_out_id = request.query_params.get('stock_out')
+        if stock_out_id:
+            queryset = queryset.filter(stock_out_id=stock_out_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        total = queryset.count()
+        approvals = queryset[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': ApprovalSerializer(approvals, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })

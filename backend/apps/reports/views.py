@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 from datetime import datetime, timedelta
-from django.db.models import Sum, Count, Q, F
+from django.db.models import F
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -13,6 +13,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from apps.core.response import success_response, error_response
 from apps.warehouse.models import Goods, StockIn, StockOut, Warning
+from .aggregation import in_totals_on, out_totals_on
 from .models import DailyReport
 
 logger = logging.getLogger('apps')
@@ -32,22 +33,11 @@ class DashboardView(APIView):
             quantity__lte=F('warning_threshold')
         ).count()
         
-        # 今日入库统计
-        today_in = StockIn.objects.filter(
-            stock_in_time__date=today
-        ).aggregate(
-            count=Count('id'),
-            total=Sum('quantity')
-        )
-        
+        # 今日入库统计（按业务日期，跨月补录归属正确）
+        today_in = in_totals_on(today)
+
         # 今日出库统计
-        today_out = StockOut.objects.filter(
-            stock_out_time__date=today,
-            status='completed'
-        ).aggregate(
-            count=Count('id'),
-            total=Sum('quantity')
-        )
+        today_out = out_totals_on(today, only_completed=True)
         
         # 待审批数量
         pending_approval_count = StockOut.objects.filter(status='pending').count()
@@ -55,19 +45,14 @@ class DashboardView(APIView):
         # 未读预警数量
         unread_warning_count = Warning.objects.filter(is_read=False).count()
         
-        # 最近7天入库趋势
+        # 最近7天收发趋势（按业务日期）
         in_trend = []
         out_trend = []
         for i in range(6, -1, -1):
             date = today - timedelta(days=i)
-            in_data = StockIn.objects.filter(
-                stock_in_time__date=date
-            ).aggregate(total=Sum('quantity'))
-            out_data = StockOut.objects.filter(
-                stock_out_time__date=date,
-                status='completed'
-            ).aggregate(total=Sum('quantity'))
-            
+            in_data = in_totals_on(date)
+            out_data = out_totals_on(date, only_completed=True)
+
             in_trend.append({
                 'date': date.strftime('%m-%d'),
                 'value': float(in_data['total'] or 0)
@@ -120,23 +105,10 @@ class DailyReportView(APIView):
         current_date = start_date
         
         while current_date <= end_date:
-            # 入库统计
-            in_data = StockIn.objects.filter(
-                stock_in_time__date=current_date
-            ).aggregate(
-                count=Count('id'),
-                total=Sum('quantity')
-            )
-            
-            # 出库统计
-            out_data = StockOut.objects.filter(
-                stock_out_time__date=current_date,
-                status='completed'
-            ).aggregate(
-                count=Count('id'),
-                total=Sum('quantity')
-            )
-            
+            # 收发统计按业务日期归属，跨月补录计入实际发生日
+            in_data = in_totals_on(current_date)
+            out_data = out_totals_on(current_date, only_completed=True)
+
             # 预警统计
             warning_count = Warning.objects.filter(
                 created_at__date=current_date

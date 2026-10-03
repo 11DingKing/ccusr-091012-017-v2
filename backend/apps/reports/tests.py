@@ -6,7 +6,7 @@ from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
 from apps.authentication.backends import generate_token
 from apps.authentication.models import User
-from apps.warehouse.models import Category, Goods, Unit, Variety, Warning
+from apps.warehouse.models import Category, Goods, StockIn, Unit, Variety, Warning
 from .cron import check_stock_warning
 from .models import DailyReport
 from .views import DashboardView
@@ -46,6 +46,26 @@ class ReportTest(TestCase):
         response = self.client.get("/api/daily-report/", {"start_date": "2026-09-29", "end_date": "2026-10-01"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()["data"]), 3)
+
+    def test_late_entry_counts_by_business_date_not_entry_date(self):
+        # 10 月才补录 9 月 30 日的入库（business_date 与录入时间跨月）
+        StockIn.objects.create(
+            goods=self.goods, operator=self.user, quantity=Decimal("6"),
+            business_date=date(2026, 9, 30),
+            period="2026-09", version_no=1,
+        )
+        rows = self.client.get("/api/daily-report/",
+                               {"start_date": "2026-09-30", "end_date": "2026-09-30"}).json()["data"]
+        self.assertEqual(rows[0]["in_count"], 1)
+        self.assertEqual(float(rows[0]["in_total"]), 6.0)
+        # 录入当天（10 月）不应计入
+        today = date.today()
+        if today != date(2026, 9, 30):
+            today_rows = self.client.get(
+                "/api/daily-report/",
+                {"start_date": today.isoformat(), "end_date": today.isoformat()}
+            ).json()["data"]
+            self.assertEqual(today_rows[0]["in_count"], 0)
 
     def test_invalid_export_type(self):
         response = self.client.get("/api/export/", {"type": "unknown"})

@@ -3,8 +3,9 @@
 """
 import logging
 from datetime import datetime, timedelta
-from django.db.models import Sum, Count, F
-from apps.warehouse.models import Goods, StockIn, StockOut, Warning
+from django.db.models import F
+from apps.warehouse.models import Goods, Warning
+from .aggregation import in_totals_on, out_totals_on
 
 logger = logging.getLogger('apps')
 
@@ -59,23 +60,10 @@ def generate_daily_report():
         logger.info(f"{yesterday} 的报表已存在，跳过生成")
         return
     
-    # 入库统计
-    in_data = StockIn.objects.filter(
-        stock_in_time__date=yesterday
-    ).aggregate(
-        count=Count('id'),
-        total=Sum('quantity')
-    )
-    
-    # 出库统计
-    out_data = StockOut.objects.filter(
-        stock_out_time__date=yesterday,
-        status='completed'
-    ).aggregate(
-        count=Count('id'),
-        total=Sum('quantity')
-    )
-    
+    # 收发统计按业务日期归属，跨月补录计入实际发生日
+    in_data = in_totals_on(yesterday)
+    out_data = out_totals_on(yesterday, only_completed=True)
+
     # 预警统计
     warning_count = Warning.objects.filter(
         created_at__date=yesterday
