@@ -14,6 +14,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "django_filters",
     "apps.authentication",
+    "apps.accounting",
     "apps.warehouse",
     "apps.personnel",
     "apps.reports",
@@ -38,6 +39,22 @@ DATABASES = {
         "OPTIONS": {"timeout": 20},
     }
 }
+
+
+# SQLite 并发加固：WAL 允许读写并发、并发写者按 busy_timeout 排队，
+# 避免会签/封账等并发提交时出现立即 "database is locked" 的不确定结果。
+from django.db.backends.signals import connection_created  # noqa: E402
+
+
+def _sqlite_pragmas(sender, connection, **kwargs):
+    if connection.vendor == "sqlite":
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA busy_timeout=20000;")
+        cursor.execute("PRAGMA foreign_keys=ON;")
+
+
+connection_created.connect(_sqlite_pragmas)
 AUTH_PASSWORD_VALIDATORS = []
 AUTH_USER_MODEL = "authentication.User"
 LANGUAGE_CODE = "zh-hans"

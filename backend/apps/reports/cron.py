@@ -59,17 +59,17 @@ def generate_daily_report():
         logger.info(f"{yesterday} 的报表已存在，跳过生成")
         return
     
-    # 入库统计
+    # 入库统计（按业务日期归日，跨月补录计入实际发生日）
     in_data = StockIn.objects.filter(
-        stock_in_time__date=yesterday
+        business_date=yesterday
     ).aggregate(
         count=Count('id'),
         total=Sum('quantity')
     )
-    
-    # 出库统计
+
+    # 出库统计（按业务日期）
     out_data = StockOut.objects.filter(
-        stock_out_time__date=yesterday,
+        business_date=yesterday,
         status='completed'
     ).aggregate(
         count=Count('id'),

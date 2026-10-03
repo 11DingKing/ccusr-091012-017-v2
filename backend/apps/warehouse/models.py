@@ -2,7 +2,37 @@
 库房管理模型
 """
 from django.db import models
+from django.utils import timezone
 from apps.authentication.models import User
+from apps.accounting.periods import period_of
+
+
+class VersionedPeriodRecordMixin:
+    """按业务月份归属、按封账版本冻结的收发记录共用逻辑"""
+
+    def _accounting_period(self):
+        # 业务日期优先；被显式清空时回退到登记当天
+        base = self.business_date
+        if base is None:
+            base = timezone.localdate()
+        return period_of(base)
+
+    def _apply_period_version_on_create(self):
+        # 延迟导入避免 warehouse -> accounting -> warehouse 的循环依赖
+        from apps.accounting.services import assign_version
+        self.period = self._accounting_period()
+        self.version_no = assign_version(self.period)
+
+    def _ensure_mutable_on_update(self):
+        from apps.accounting.services import ensure_period_editable, ensure_record_mutable
+        ensure_record_mutable(self)
+        new_period = self._accounting_period()
+        # 业务日期跨月调整时，目标月份也必须未封账
+        if new_period != self.period:
+            ensure_period_editable(new_period)
+            from apps.accounting.services import assign_version
+            self.period = new_period
+            self.version_no = assign_version(new_period)
 
 
 class Unit(models.Model):
@@ -129,7 +159,7 @@ class Goods(models.Model):
         return self.quantity <= self.warning_threshold
 
 
-class StockIn(models.Model):
+class StockIn(VersionedPeriodRecordMixin, models.Model):
     """入库记录模型"""
     goods = models.ForeignKey(
         Goods, on_delete=models.CASCADE,
@@ -142,20 +172,37 @@ class StockIn(models.Model):
     quantity = models.DecimalField('入库数量', max_digits=12, decimal_places=2)
     batch_no = models.CharField('批次号', max_length=50, blank=True)
     supplier = models.CharField('供应商', max_length=200, blank=True)
-    stock_in_time = models.DateTimeField('入库时间', auto_now_add=True)
+    # 业务日期：收发实际发生日期，迟到补录时可指向已过去的月份（跨月归月据此判定）
+    business_date = models.DateField('业务日期', default=timezone.localdate, db_index=True)
+    # 归属月份 YYYY-MM 与封账版本号，保存时由封账服务确定
+    period = models.CharField('归属月份', max_length=7, blank=True, db_index=True)
+    version_no = models.PositiveIntegerField('封账版本号', default=1)
+    stock_in_time = models.DateTimeField('登记时间', auto_now_add=True)
     remark = models.TextField('备注', blank=True)
-    
+
     class Meta:
         db_table = 'wh_stock_in'
         verbose_name = '入库记录'
         verbose_name_plural = verbose_name
         ordering = ['-stock_in_time']
-    
+
     def __str__(self):
         return f"{self.goods.name} - {self.quantity}"
 
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            self._apply_period_version_on_create()
+        elif not kwargs.pop('skip_guard', False):
+            self._ensure_mutable_on_update()
+        super().save(*args, **kwargs)
 
-class StockOut(models.Model):
+    def delete(self, *args, **kwargs):
+        from apps.accounting.services import ensure_record_mutable
+        ensure_record_mutable(self)
+        super().delete(*args, **kwargs)
+
+
+class StockOut(VersionedPeriodRecordMixin, models.Model):
     """出库记录模型"""
     STATUS_CHOICES = [
         ('pending', '待审批'),
@@ -176,18 +223,36 @@ class StockOut(models.Model):
     receiver_dept = models.CharField('领用部门', max_length=100, blank=True)
     quantity = models.DecimalField('出库数量', max_digits=12, decimal_places=2)
     status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
-    stock_out_time = models.DateTimeField('出库时间', null=True, blank=True)
+    # 业务日期：领用实际发生日期，用于跨月归月
+    business_date = models.DateField('业务日期', default=timezone.localdate, db_index=True)
+    # 归属月份 YYYY-MM 与封账版本号，保存时由封账服务确定
+    period = models.CharField('归属月份', max_length=7, blank=True, db_index=True)
+    version_no = models.PositiveIntegerField('封账版本号', default=1)
+    stock_out_time = models.DateTimeField('出库完成时间', null=True, blank=True)
     remark = models.TextField('备注', blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
-    
+
     class Meta:
         db_table = 'wh_stock_out'
         verbose_name = '出库记录'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.goods.name} - {self.quantity}"
+
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            self._apply_period_version_on_create()
+        elif not kwargs.pop('skip_guard', False):
+            # 审批状态流转也属于敏感变更，封账/签署期间一并冻结
+            self._ensure_mutable_on_update()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from apps.accounting.services import ensure_record_mutable
+        ensure_record_mutable(self)
+        super().delete(*args, **kwargs)
 
 
 class Warning(models.Model):

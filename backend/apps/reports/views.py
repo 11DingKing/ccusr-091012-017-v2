@@ -32,17 +32,17 @@ class DashboardView(APIView):
             quantity__lte=F('warning_threshold')
         ).count()
         
-        # 今日入库统计
+        # 今日入库统计（按业务日期归月，跨月补录计入实际发生日）
         today_in = StockIn.objects.filter(
-            stock_in_time__date=today
+            business_date=today
         ).aggregate(
             count=Count('id'),
             total=Sum('quantity')
         )
-        
+
         # 今日出库统计
         today_out = StockOut.objects.filter(
-            stock_out_time__date=today,
+            business_date=today,
             status='completed'
         ).aggregate(
             count=Count('id'),
@@ -61,10 +61,10 @@ class DashboardView(APIView):
         for i in range(6, -1, -1):
             date = today - timedelta(days=i)
             in_data = StockIn.objects.filter(
-                stock_in_time__date=date
+                business_date=date
             ).aggregate(total=Sum('quantity'))
             out_data = StockOut.objects.filter(
-                stock_out_time__date=date,
+                business_date=date,
                 status='completed'
             ).aggregate(total=Sum('quantity'))
             
@@ -120,17 +120,17 @@ class DailyReportView(APIView):
         current_date = start_date
         
         while current_date <= end_date:
-            # 入库统计
+            # 入库统计（按业务日期）
             in_data = StockIn.objects.filter(
-                stock_in_time__date=current_date
+                business_date=current_date
             ).aggregate(
                 count=Count('id'),
                 total=Sum('quantity')
             )
-            
-            # 出库统计
+
+            # 出库统计（按业务日期）
             out_data = StockOut.objects.filter(
-                stock_out_time__date=current_date,
+                business_date=current_date,
                 status='completed'
             ).aggregate(
                 count=Count('id'),

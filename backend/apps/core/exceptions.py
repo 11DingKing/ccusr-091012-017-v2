@@ -52,6 +52,16 @@ def custom_exception_handler(exc, context):
             'message': exc.message,
             'data': None
         }, status=exc.code)
+
+    # 处理月结封账业务异常
+    from apps.accounting.errors import AccountingError
+    if isinstance(exc, AccountingError):
+        return Response({
+            'success': False,
+            'code': exc.code,
+            'message': exc.message,
+            'data': None
+        }, status=exc.code)
     
     # 处理Django验证异常
     if isinstance(exc, DjangoValidationError):

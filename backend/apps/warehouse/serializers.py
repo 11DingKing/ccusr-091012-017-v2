@@ -152,13 +152,16 @@ class StockInSerializer(serializers.ModelSerializer):
     """入库记录序列化器"""
     goods_name = serializers.CharField(source='goods.name', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
-    
+
     class Meta:
         model = StockIn
         fields = [
             'id', 'goods', 'goods_name', 'operator', 'operator_name',
-            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark'
+            'quantity', 'batch_no', 'supplier',
+            'business_date', 'period', 'version_no',
+            'stock_in_time', 'remark'
         ]
+        read_only_fields = ['period', 'version_no', 'stock_in_time']
 
 
 class StockOutSerializer(serializers.ModelSerializer):
@@ -166,14 +169,16 @@ class StockOutSerializer(serializers.ModelSerializer):
     goods_name = serializers.CharField(source='goods.name', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = StockOut
         fields = [
             'id', 'goods', 'goods_name', 'operator', 'operator_name',
             'receiver', 'receiver_dept', 'quantity', 'status', 'status_display',
+            'business_date', 'period', 'version_no',
             'stock_out_time', 'remark', 'created_at'
         ]
+        read_only_fields = ['period', 'version_no']
 
 
 class WarningSerializer(serializers.ModelSerializer):
